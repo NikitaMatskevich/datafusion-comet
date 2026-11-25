@@ -1,0 +1,90 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Recover Comet PR 5724 infrastructure
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '11,26,41,56 * * * *'
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: comet-pr-5724-infrastructure-recovery
+  cancel-in-progress: false
+jobs:
+  recover:
+    if: github.repository == 'NikitaMatskevich/datafusion-comet' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const runId = 45380587918;
+            const expectedHead = '040888511b0e0c81e8a815b9955127f7c78553a6';
+            const repo = context.repo;
+            const stop = async (reason, failed = false) => {
+              core.notice(reason);
+              await github.rest.actions.disableWorkflow({
+                ...repo, workflow_id: 'fork_ci_recovery.yml',
+              });
+              if (failed) core.setFailed(reason);
+            };
+            const {data: pr} = await github.rest.pulls.get({
+              owner: 'apache', repo: 'datafusion-comet', pull_number: 5724,
+            });
+            if (pr.state !== 'open' || pr.head.sha !== expectedHead) {
+              await stop('PR closed or head changed; stopping this revision-specific watch.');
+              return;
+            }
+            const {data: run} = await github.rest.actions.getWorkflowRun({
+              ...repo, run_id: runId,
+            });
+            if (run.head_sha !== expectedHead) {
+              await stop('Unexpected run revision; manual investigation required.', true);
+              return;
+            }
+            if (run.status !== 'completed') {
+              core.notice(`Run ${runId}, attempt ${run.run_attempt}: ${run.status}.`);
+              return;
+            }
+            if (run.conclusion === 'success') {
+              await stop('Full CI is green. Recovery watch disabled.');
+              return;
+            }
+            if (run.conclusion === 'cancelled') {
+              await stop('Workflow was cancelled; leaving the cancellation in place.');
+              return;
+            }
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              ...repo, run_id: runId, filter: 'latest', per_page: 10,
+            });
+            const unsuccessful = jobs.filter(job =>
+              !['success', 'skipped', 'neutral'].includes(job.conclusion));
+            const roots = unsuccessful.filter(job => !job.name.endsWith('Required Checks'));
+            const noRunner = job =>
+              job.name.startsWith('PR Build (macOS) /') &&
+              job.conclusion === 'cancelled' && !job.runner_name &&
+              (job.steps || []).length === 0;
+            if (roots.length === 0 || !roots.every(noRunner)) {
+              await stop('CI has a failure other than unstarted macOS jobs; investigation required: ' +
+                roots.map(job => `${job.name}: ${job.conclusion}`).join('; '), true);
+              return;
+            }
+            await github.rest.actions.reRunWorkflowFailedJobs({...repo, run_id: runId});
+            core.notice(`Retried ${roots.length} unstarted macOS jobs in run ${runId}; completed results preserved.`);
